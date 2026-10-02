@@ -1,0 +1,12 @@
+/build/
+/build-sdk/
+/CMakeUserPresets.json
+/sdk/
+/packages/
+*.user
+
+/build-*/
+
+/package/
+
+*.pdb
