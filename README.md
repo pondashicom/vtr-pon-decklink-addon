@@ -25,6 +25,10 @@ Configure input and output under **Settings → DeckLink** in VTR-PON. For input
 
 Available input/output formats, connectors, full-duplex operation, automatic format detection, and synchronized playback depend on the device and its profile. Specify the format manually if automatic detection is not supported. Physical synchronization is not guaranteed when fill and key are played independently.
 
+The current source rejects automatic input mode on devices without format detection instead of silently choosing the first format. Select the actual source format before adding the input; changing this default does not change items already in the playlist. Half-duplex channels can capture or output, but cannot do both at once. Multiple connectors do not imply multiple independent channels. A busy channel is rejected before its configuration or streams are changed.
+
+The unreleased input fixes were accepted with SDI 1080p59.94 and direct-to-card HDMI 1080p29.97 video and audible stereo on DeckLink HD Extreme 3D. The HDMI bracket path on this test unit was treated as an internal cable fault. The current fill/key implementation requires two independent logical channels; the single-channel hardware external-keyer path is not yet implemented. See the hardware check record for exact acceptance conditions and remaining work.
+
 **Unreleased source update (2026-10-12):** Older cards without a persistent hardware ID, including DeckLink HD Extreme 3D, are identified by their PCIe location. Reselect their input/output channels in VTR-PON after moving or replacing the card. Ambiguous device identifiers are not offered for selection. Output startup now includes audio preroll and retains device configuration for the output session. HDMI 1080p60 video playback and SDI video output were checked with this card; see the [hardware check record and remaining checks](docs/hardware-checklist.md). These fixes are not included in the existing 0.3.0 package.
 
 This add-on targets VTR-PON 3.0.0-beta.1. For other VTR-PON versions, check the compatibility information in the relevant release.

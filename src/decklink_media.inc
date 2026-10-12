@@ -20,10 +20,16 @@ struct InputSession {
     ComPtr<IDeckLinkConfiguration> config;
     std::shared_ptr<InputState> state = std::make_shared<InputState>();
     bool stopped = false;
+    bool callbackSet = false, videoEnabled = false, audioEnabled = false, streamsStarted = false;
     void stop() {
         if (stopped) return; stopped = true;
         { std::lock_guard lock(state->mutex); state->stopping = true; }
-        if (input) { input->StopStreams(); input->SetCallback(nullptr); input->DisableAudioInput(); input->DisableVideoInput(); }
+        if (input) {
+            if (streamsStarted) input->StopStreams();
+            if (callbackSet) input->SetCallback(nullptr);
+            if (audioEnabled) input->DisableAudioInput();
+            if (videoEnabled) input->DisableVideoInput();
+        }
     }
     ~InputSession() { stop(); }
 };
@@ -179,28 +185,48 @@ ComPtr<IDeckLink> selected(Context &c, const VtrPonDeckLinkStreamOptions *option
     }
     return match;
 }
+bool outputFailed(HRESULT result, const char *operation, char *error, uint32_t cap);
+bool directionAvailable(const ComPtr<IDeckLink> &device, bool input, char *error, uint32_t cap) {
+    ComPtr<IDeckLinkProfileAttributes> attrs; LONGLONG duplex = 0, busy = 0;
+    ComPtr<IDeckLinkStatus> status;
+    if (FAILED(device.As(&status)) || FAILED(status->GetInt(bmdDeckLinkStatusBusy, &busy))) return true;
+    if (busy & (input ? bmdDeviceCaptureBusy : bmdDevicePlaybackBusy)) {
+        message(error, cap, input ? "This DeckLink input channel is already in use." : "This DeckLink output channel is already in use.");
+        return false;
+    }
+    if (SUCCEEDED(device.As(&attrs)) && SUCCEEDED(attrs->GetInt(BMDDeckLinkDuplex, &duplex)) && duplex == bmdDuplexHalf &&
+        (busy & (input ? bmdDevicePlaybackBusy : bmdDeviceCaptureBusy))) {
+        message(error, cap, input ? "This DeckLink channel is half-duplex and is outputting. Disable its output before capturing."
+            : "This DeckLink channel is half-duplex and is capturing. Release its input before enabling output.");
+        return false;
+    }
+    return true;
+}
 int32_t VTRPON_DECKLINK_CALL openInput(void *handle, const VtrPonDeckLinkStreamOptions *options, char *error, uint32_t cap) noexcept {
     return mediaCall(handle, error, cap, [&](Context &c) -> int32_t {
         if (c.inputState) return VtrPonDeckLinkInvalidArgument;
         auto device = selected(c, options, 1); if (!device) { message(error, cap, "Selected input channel is unavailable."); return VtrPonDeckLinkInvalidArgument; }
-        auto session = std::make_shared<InputSession>(); auto s = session->state; auto &config = session->config; ComPtr<IDeckLinkProfileAttributes> attrs;
-        if (FAILED(device.As(&session->input)) || FAILED(device.As(&config)) ||
-            FAILED(config->SetInt(bmdDeckLinkConfigVideoInputConnection, options->connection))) { message(error, cap, "Input connection is unavailable or busy."); return VtrPonDeckLinkBackendError; }
-        // Use audio embedded in the selected digital video connector. Fixed
-        // audio connections need no configuration; analog uses the device setup.
-        if (options->connection & (bmdVideoConnectionSDI | bmdVideoConnectionHDMI | bmdVideoConnectionOpticalSDI)) {
-            LONGLONG audioConnection = 0;
-            if (SUCCEEDED(config->GetInt(bmdDeckLinkConfigAudioInputConnection, &audioConnection)) &&
-                audioConnection != bmdAudioConnectionEmbedded &&
-                FAILED(config->SetInt(bmdDeckLinkConfigAudioInputConnection, bmdAudioConnectionEmbedded))) {
-                message(error, cap, "Embedded audio input could not be selected."); return VtrPonDeckLinkBackendError;
-            }
+        ComPtr<IDeckLinkProfileAttributes> attrs; BOOL detect = FALSE;
+        if (SUCCEEDED(device.As(&attrs))) attrs->GetFlag(BMDDeckLinkSupportsInputFormatDetection, &detect);
+        // Do not silently start an unrelated first mode (often NTSC). No
+        // configuration is changed until the requested mode is validated.
+        if (!options->modeId && !detect) {
+            message(error, cap, "This DeckLink device does not support automatic input format detection. Select the source's input format in Settings > DeckLink, then add the input again.");
+            return VtrPonDeckLinkInvalidArgument;
         }
-        BOOL detect = FALSE; if (SUCCEEDED(device.As(&attrs))) attrs->GetFlag(BMDDeckLinkSupportsInputFormatDetection, &detect);
-        if (!options->modeId && detect) s->flags = bmdVideoInputEnableFormatDetection;
+        if (!directionAvailable(device, true, error, cap)) return VtrPonDeckLinkBackendError;
+        auto session = std::make_shared<InputSession>(); auto s = session->state; auto &config = session->config;
+        if (outputFailed(device.As(&session->input), "QueryInterface(Input)", error, cap)) return VtrPonDeckLinkBackendError;
+        if (!options->modeId) s->flags = bmdVideoInputEnableFormatDetection;
         ComPtr<IDeckLinkDisplayMode> mode;
-        if (options->modeId) session->input->GetDisplayMode(static_cast<BMDDisplayMode>(options->modeId), &mode);
-        else {
+        if (options->modeId) {
+            BOOL supported = FALSE; BMDDisplayMode actual{};
+            if (outputFailed(session->input->DoesSupportVideoMode(static_cast<BMDVideoConnection>(options->connection),
+                    static_cast<BMDDisplayMode>(options->modeId), bmdFormat8BitYUV, bmdNoVideoInputConversion,
+                    bmdSupportedVideoModeDefault, &actual, &supported), "DoesSupportVideoMode(Input)", error, cap)) return VtrPonDeckLinkBackendError;
+            if (!supported) { message(error, cap, "The selected input format is unsupported on this DeckLink connector."); return VtrPonDeckLinkInvalidArgument; }
+            if (outputFailed(session->input->GetDisplayMode(static_cast<BMDDisplayMode>(options->modeId), &mode), "GetDisplayMode(Input)", error, cap)) return VtrPonDeckLinkBackendError;
+        } else {
             ComPtr<IDeckLinkDisplayModeIterator> it; session->input->GetDisplayModeIterator(&it);
             if (it) for (;;) {
                 ComPtr<IDeckLinkDisplayMode> candidate; if (it->Next(&candidate) != S_OK) break;
@@ -211,13 +237,30 @@ int32_t VTRPON_DECKLINK_CALL openInput(void *handle, const VtrPonDeckLinkStreamO
             }
         }
         if (!mode) { message(error, cap, "No supported input format was found."); return VtrPonDeckLinkBackendError; }
-        BMDTimeValue duration = 0; BMDTimeScale scale = 0; mode->GetFrameRate(&duration, &scale);
+        if (outputFailed(device.As(&config), "QueryInterface(InputConfiguration)", error, cap) ||
+            outputFailed(config->SetInt(bmdDeckLinkConfigVideoInputConnection, options->connection), "SetVideoInputConnection", error, cap)) return VtrPonDeckLinkBackendError;
+        // Use audio embedded in the selected digital video connector. Fixed
+        // audio connections need no configuration; analog uses the device setup.
+        if (options->connection & (bmdVideoConnectionSDI | bmdVideoConnectionHDMI | bmdVideoConnectionOpticalSDI)) {
+            LONGLONG audioConnection = 0;
+            if (SUCCEEDED(config->GetInt(bmdDeckLinkConfigAudioInputConnection, &audioConnection)) &&
+                audioConnection != bmdAudioConnectionEmbedded &&
+                FAILED(config->SetInt(bmdDeckLinkConfigAudioInputConnection, bmdAudioConnectionEmbedded))) {
+                message(error, cap, "Embedded audio input could not be selected."); return VtrPonDeckLinkBackendError;
+            }
+        }
+        BMDTimeValue duration = 0; BMDTimeScale scale = 0;
+        if (outputFailed(mode->GetFrameRate(&duration, &scale), "GetFrameRate(Input)", error, cap) || duration <= 0 || scale <= 0 || duration > UINT32_MAX || scale > UINT32_MAX) return VtrPonDeckLinkBackendError;
         s->field = mode->GetFieldDominance(); s->duration = static_cast<uint32_t>(duration); s->scale = static_cast<uint32_t>(scale);
         ComPtr<IDeckLinkInputCallback> callback; callback.Attach(new InputCallback(s));
-        if (FAILED(session->input->SetCallback(callback.Get())) || FAILED(session->input->EnableVideoInput(mode->GetDisplayMode(), bmdFormat8BitYUV, s->flags)) ||
-            FAILED(session->input->EnableAudioInput(bmdAudioSampleRate48kHz, bmdAudioSampleType32bitInteger, 2)) || FAILED(session->input->StartStreams())) {
-            message(error, cap, "DeckLink input could not start; check device profile, format and channel ownership."); return VtrPonDeckLinkBackendError;
-        }
+        if (outputFailed(session->input->SetCallback(callback.Get()), "SetCallback(Input)", error, cap)) return VtrPonDeckLinkBackendError;
+        session->callbackSet = true;
+        if (outputFailed(session->input->EnableVideoInput(mode->GetDisplayMode(), bmdFormat8BitYUV, s->flags), "EnableVideoInput", error, cap)) return VtrPonDeckLinkBackendError;
+        session->videoEnabled = true;
+        if (outputFailed(session->input->EnableAudioInput(bmdAudioSampleRate48kHz, bmdAudioSampleType32bitInteger, 2), "EnableAudioInput", error, cap)) return VtrPonDeckLinkBackendError;
+        session->audioEnabled = true;
+        if (outputFailed(session->input->StartStreams(), "StartStreams(Input)", error, cap)) return VtrPonDeckLinkBackendError;
+        session->streamsStarted = true;
         c.inputState = session; return VtrPonDeckLinkOk;
     });
 }
@@ -308,6 +351,7 @@ int32_t openOutputImpl(void *handle, const VtrPonDeckLinkStreamOptions *options,
     return mediaCall(handle, error, cap, [&](Context &c) -> int32_t {
         if (c.outputState || !options || options->structSize != sizeof(*options) || !options->modeId || options->outputStartTime100ns <= 0) return VtrPonDeckLinkInvalidArgument;
         auto device = selected(c, options, 2); if (!device) return VtrPonDeckLinkInvalidArgument;
+        if (!directionAvailable(device, false, error, cap)) return VtrPonDeckLinkBackendError;
         auto s = std::make_shared<OutputState>(); auto &config = s->config; ComPtr<IDeckLinkDisplayMode> mode;
         if (outputFailed(device.As(&s->output), "QueryInterface(Output)", error, cap) || outputFailed(device.As(&config), "QueryInterface(Configuration)", error, cap) ||
             outputFailed(config->SetInt(bmdDeckLinkConfigVideoOutputConnection, options->connection), "SetVideoOutputConnection", error, cap) ||
