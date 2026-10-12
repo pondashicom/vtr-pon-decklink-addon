@@ -25,6 +25,8 @@ Configure input and output under **Settings → DeckLink** in VTR-PON. For input
 
 Available input/output formats, connectors, full-duplex operation, automatic format detection, and synchronized playback depend on the device and its profile. Specify the format manually if automatic detection is not supported. Physical synchronization is not guaranteed when fill and key are played independently.
 
+**Unreleased source update (2026-10-12):** Older cards without a persistent hardware ID, including DeckLink HD Extreme 3D, are identified by their PCIe location. Reselect their input/output channels in VTR-PON after moving or replacing the card. Ambiguous device identifiers are not offered for selection. Output startup now includes audio preroll and retains device configuration for the output session. HDMI 1080p60 video playback and SDI video output were checked with this card; see the [hardware check record and remaining checks](docs/hardware-checklist.md). These fixes are not included in the existing 0.3.0 package.
+
 This add-on targets VTR-PON 3.0.0-beta.1. For other VTR-PON versions, check the compatibility information in the relevant release.
 
 ## License, source code, and support

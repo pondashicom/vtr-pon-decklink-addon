@@ -17,6 +17,7 @@ struct InputState {
 };
 struct InputSession {
     ComPtr<IDeckLinkInput> input;
+    ComPtr<IDeckLinkConfiguration> config;
     std::shared_ptr<InputState> state = std::make_shared<InputState>();
     bool stopped = false;
     void stop() {
@@ -90,7 +91,7 @@ public:
 };
 struct OutputState {
     ComPtr<IDeckLinkOutput> output;
-    ComPtr<IDeckLinkConfiguration> groupConfig;
+    ComPtr<IDeckLinkConfiguration> config;
     ComPtr<IDeckLinkStatus> status;
     int64_t groupId = 0, previousGroup = 0, boardId = 0;
     bool internalReference = false;
@@ -114,7 +115,7 @@ struct OutputState {
             if (audioEnabled) output->DisableAudioOutput();
             if (videoEnabled) output->DisableVideoOutput();
         }
-        if (groupConfig) groupConfig->SetInt(bmdDeckLinkConfigPlaybackGroup, previousGroup);
+        if (config && groupId) config->SetInt(bmdDeckLinkConfigPlaybackGroup, previousGroup);
     }
 };
 void closeMedia(Context *c) noexcept { if (c->inputState) std::static_pointer_cast<InputSession>(c->inputState)->stop(); c->inputState.reset(); c->outputState.reset(); }
@@ -122,6 +123,13 @@ template<class Fn> int32_t mediaCall(void *handle, char *error, uint32_t capacit
     const auto status = check(handle, error, capacity); if (status) return status;
     try { return fn(*static_cast<Context *>(handle)); }
     catch (...) { message(error, capacity, "DeckLink media allocation or backend operation failed."); return VtrPonDeckLinkBackendError; }
+}
+// Older cards (including HD Extreme 3D) have no PersistentID. As in the SDK
+// samples, their topology ID identifies the installed PCIe location instead.
+// Use exactly the same choice for discovery and opening a saved channel.
+bool channelIdentity(IDeckLinkProfileAttributes *attrs, LONGLONG &id) {
+    return SUCCEEDED(attrs->GetInt(BMDDeckLinkPersistentID, &id)) ||
+        SUCCEEDED(attrs->GetInt(BMDDeckLinkTopologicalID, &id));
 }
 int32_t VTRPON_DECKLINK_CALL channels(void *handle, VtrPonDeckLinkChannel *out, uint32_t capacity,
     uint32_t *count, char *error, uint32_t errorCapacity) noexcept {
@@ -133,7 +141,7 @@ int32_t VTRPON_DECKLINK_CALL channels(void *handle, VtrPonDeckLinkChannel *out, 
             ComPtr<IDeckLinkProfileAttributes> attrs;
             if (FAILED(c.devices[i].As(&attrs))) continue;
             LONGLONG id = 0, sub = 0, support = 0;
-            const bool stable = SUCCEEDED(attrs->GetInt(BMDDeckLinkPersistentID, &id));
+            const bool stable = channelIdentity(attrs.Get(), id);
             attrs->GetInt(BMDDeckLinkSubDeviceIndex, &sub); attrs->GetInt(BMDDeckLinkVideoIOSupport, &support);
             for (uint32_t direction : {1u, 2u}) {
                 if (!(support & (direction == 1 ? bmdDeviceSupportsCapture : bmdDeviceSupportsPlayback))) continue;
@@ -148,26 +156,34 @@ int32_t VTRPON_DECKLINK_CALL channels(void *handle, VtrPonDeckLinkChannel *out, 
                 }
             }
         }
+        // Never silently select one of two devices with the same fallback key.
+        for (auto &record : records) for (const auto &other : records)
+            if (record.deviceIndex != other.deviceIndex && record.persistentId == other.persistentId &&
+                record.subDeviceIndex == other.subDeviceIndex) record.stableId = 0;
         return copy(records, out, capacity, count, error, errorCapacity);
     });
 }
 ComPtr<IDeckLink> selected(Context &c, const VtrPonDeckLinkStreamOptions *options, uint32_t direction) {
     if (!options || options->structSize != sizeof(*options) || !options->connection ||
         (options->connection & (options->connection - 1))) return {};
+    ComPtr<IDeckLink> match;
     for (auto &device : c.devices) {
         ComPtr<IDeckLinkProfileAttributes> a; LONGLONG id = 0, sub = 0, connections = 0;
-        if (FAILED(device.As(&a)) || FAILED(a->GetInt(BMDDeckLinkPersistentID, &id))) continue;
+        if (FAILED(device.As(&a)) || !channelIdentity(a.Get(), id)) continue;
         a->GetInt(BMDDeckLinkSubDeviceIndex, &sub);
         a->GetInt(direction == 1 ? BMDDeckLinkVideoInputConnections : BMDDeckLinkVideoOutputConnections, &connections);
-        if (id == options->persistentId && sub == options->subDeviceIndex && (connections & options->connection)) return device;
+        if (id == options->persistentId && sub == options->subDeviceIndex && (connections & options->connection)) {
+            if (match) return {};
+            match = device;
+        }
     }
-    return {};
+    return match;
 }
 int32_t VTRPON_DECKLINK_CALL openInput(void *handle, const VtrPonDeckLinkStreamOptions *options, char *error, uint32_t cap) noexcept {
     return mediaCall(handle, error, cap, [&](Context &c) -> int32_t {
         if (c.inputState) return VtrPonDeckLinkInvalidArgument;
         auto device = selected(c, options, 1); if (!device) { message(error, cap, "Selected input channel is unavailable."); return VtrPonDeckLinkInvalidArgument; }
-        auto session = std::make_shared<InputSession>(); auto s = session->state; ComPtr<IDeckLinkConfiguration> config; ComPtr<IDeckLinkProfileAttributes> attrs;
+        auto session = std::make_shared<InputSession>(); auto s = session->state; auto &config = session->config; ComPtr<IDeckLinkProfileAttributes> attrs;
         if (FAILED(device.As(&session->input)) || FAILED(device.As(&config)) ||
             FAILED(config->SetInt(bmdDeckLinkConfigVideoInputConnection, options->connection))) { message(error, cap, "Input connection is unavailable or busy."); return VtrPonDeckLinkBackendError; }
         // Use audio embedded in the selected digital video connector. Fixed
@@ -228,14 +244,21 @@ int32_t VTRPON_DECKLINK_CALL readInput(void *handle, VtrPonDeckLinkPacket *out, 
 int32_t VTRPON_DECKLINK_CALL closeInput(void *handle, char *error, uint32_t cap) noexcept {
     return mediaCall(handle, error, cap, [](Context &c) -> int32_t { if (c.inputState) std::static_pointer_cast<InputSession>(c.inputState)->stop(); c.inputState.reset(); return VtrPonDeckLinkOk; });
 }
-int32_t pump(OutputState &s) {
+bool outputFailed(HRESULT result, const char *operation, char *error, uint32_t cap) {
+    if (SUCCEEDED(result)) return false;
+    char detail[256]{};
+    std::snprintf(detail, sizeof(detail), "DeckLink %s failed (0x%08lX).", operation, static_cast<unsigned long>(result));
+    message(error, cap, detail);
+    return true;
+}
+int32_t pump(OutputState &s, char *error, uint32_t cap) {
     if (s.groupId && s.running && !s.internalReference) {
         BOOL locked = FALSE;
         if (!s.status || FAILED(s.status->GetFlag(bmdDeckLinkStatusReferenceSignalLocked, &locked)) || !locked)
             return VtrPonDeckLinkBackendError;
     }
     unsigned buffered = 0;
-    if (FAILED(s.output->GetBufferedVideoFrameCount(&buffered))) return VtrPonDeckLinkBackendError;
+    if (outputFailed(s.output->GetBufferedVideoFrameCount(&buffered), "GetBufferedVideoFrameCount", error, cap)) return VtrPonDeckLinkBackendError;
     BMDTimeValue clock = 0; double speed = 0;
     if (s.running && SUCCEEDED(s.output->GetScheduledStreamTime(s.scale, &clock, &speed)))
         s.nextVideo = std::max(s.nextVideo, (clock / s.duration + 1) * s.duration);
@@ -247,21 +270,21 @@ int32_t pump(OutputState &s) {
             s.latest = std::move(s.video.front().bytes); s.video.pop_front();
         }
         ComPtr<IDeckLinkMutableVideoFrame> source, frame;
-        if (FAILED(s.output->CreateVideoFrame(s.width, s.height, s.width * 4, bmdFormat8BitBGRA, bmdFrameFlagDefault, &source))) return VtrPonDeckLinkBackendError;
+        if (outputFailed(s.output->CreateVideoFrame(s.width, s.height, s.width * 4, bmdFormat8BitBGRA, bmdFrameFlagDefault, &source), "CreateVideoFrame(BGRA)", error, cap)) return VtrPonDeckLinkBackendError;
         ComPtr<IDeckLinkVideoBuffer> buffer; void *bytes = nullptr;
-        if (FAILED(source.As(&buffer)) || FAILED(buffer->StartAccess(bmdBufferAccessWrite))) return VtrPonDeckLinkBackendError;
+        if (outputFailed(source.As(&buffer), "QueryInterface(VideoBuffer)", error, cap) || outputFailed(buffer->StartAccess(bmdBufferAccessWrite), "StartAccess", error, cap)) return VtrPonDeckLinkBackendError;
         const auto hr = buffer->GetBytes(&bytes);
         if (SUCCEEDED(hr) && bytes) std::memcpy(bytes, s.latest.data(), s.latest.size());
-        buffer->EndAccess(bmdBufferAccessWrite); if (FAILED(hr) || !bytes) return VtrPonDeckLinkBackendError;
+        buffer->EndAccess(bmdBufferAccessWrite); if (outputFailed(hr, "GetBytes", error, cap) || !bytes) return VtrPonDeckLinkBackendError;
         frame = source;
         if (s.pixel != bmdFormat8BitBGRA) {
-            if (FAILED(s.output->CreateVideoFrame(s.width, s.height, s.rowBytes, s.pixel, bmdFrameFlagDefault, &frame)) ||
-                FAILED(s.converter->ConvertFrame(source.Get(), frame.Get()))) return VtrPonDeckLinkBackendError;
+            if (outputFailed(s.output->CreateVideoFrame(s.width, s.height, s.rowBytes, s.pixel, bmdFrameFlagDefault, &frame), "CreateVideoFrame(YUV)", error, cap) ||
+                outputFailed(s.converter->ConvertFrame(source.Get(), frame.Get()), "ConvertFrame", error, cap)) return VtrPonDeckLinkBackendError;
         }
-        if (FAILED(s.output->ScheduleVideoFrame(frame.Get(), s.nextVideo, s.duration, s.scale))) return VtrPonDeckLinkBackendError;
+        if (outputFailed(s.output->ScheduleVideoFrame(frame.Get(), s.nextVideo, s.duration, s.scale), "ScheduleVideoFrame", error, cap)) return VtrPonDeckLinkBackendError;
         s.nextVideo += s.duration;
     }
-    if (FAILED(s.output->GetBufferedAudioSampleFrameCount(&buffered))) return VtrPonDeckLinkBackendError;
+    if (outputFailed(s.output->GetBufferedAudioSampleFrameCount(&buffered), "GetBufferedAudioSampleFrameCount", error, cap)) return VtrPonDeckLinkBackendError;
     if (s.running && SUCCEEDED(s.output->GetScheduledStreamTime(48000, &clock, &speed))) s.nextAudio = std::max(s.nextAudio, clock);
     const auto target = static_cast<unsigned>((48000 * s.duration * 3 + s.scale - 1) / s.scale);
     if (buffered < target) {
@@ -273,7 +296,7 @@ int32_t pump(OutputState &s) {
                 size_t(end - begin) * 2, samples.data() + (begin - s.nextAudio) * 2);
         }
         unsigned written = 0;
-        if (FAILED(s.output->ScheduleAudioSamples(samples.data(), count, s.nextAudio, 48000, &written)) || written > count) return VtrPonDeckLinkBackendError;
+        if (outputFailed(s.output->ScheduleAudioSamples(samples.data(), count, s.nextAudio, 48000, &written), "ScheduleAudioSamples", error, cap) || written > count) return VtrPonDeckLinkBackendError;
         s.nextAudio += written;
         while (!s.audio.empty() && s.audio.front().start + static_cast<int64_t>(s.audio.front().samples.size() / 2) <= s.nextAudio) {
             s.audioSamples -= s.audio.front().samples.size(); s.audio.pop_front();
@@ -285,10 +308,10 @@ int32_t openOutputImpl(void *handle, const VtrPonDeckLinkStreamOptions *options,
     return mediaCall(handle, error, cap, [&](Context &c) -> int32_t {
         if (c.outputState || !options || options->structSize != sizeof(*options) || !options->modeId || options->outputStartTime100ns <= 0) return VtrPonDeckLinkInvalidArgument;
         auto device = selected(c, options, 2); if (!device) return VtrPonDeckLinkInvalidArgument;
-        auto s = std::make_shared<OutputState>(); ComPtr<IDeckLinkConfiguration> config; ComPtr<IDeckLinkDisplayMode> mode;
-        if (FAILED(device.As(&s->output)) || FAILED(device.As(&config)) ||
-            FAILED(config->SetInt(bmdDeckLinkConfigVideoOutputConnection, options->connection)) ||
-            FAILED(s->output->GetDisplayMode(static_cast<BMDDisplayMode>(options->modeId), &mode))) return VtrPonDeckLinkBackendError;
+        auto s = std::make_shared<OutputState>(); auto &config = s->config; ComPtr<IDeckLinkDisplayMode> mode;
+        if (outputFailed(device.As(&s->output), "QueryInterface(Output)", error, cap) || outputFailed(device.As(&config), "QueryInterface(Configuration)", error, cap) ||
+            outputFailed(config->SetInt(bmdDeckLinkConfigVideoOutputConnection, options->connection), "SetVideoOutputConnection", error, cap) ||
+            outputFailed(s->output->GetDisplayMode(static_cast<BMDDisplayMode>(options->modeId), &mode), "GetDisplayMode", error, cap)) return VtrPonDeckLinkBackendError;
         s->width = mode->GetWidth(); s->height = mode->GetHeight();
         if (groupId) {
             ComPtr<IDeckLinkProfileAttributes> attributes; BOOL supported = FALSE, locked = FALSE;
@@ -305,7 +328,7 @@ int32_t openOutputImpl(void *handle, const VtrPonDeckLinkStreamOptions *options,
             }
             if (FAILED(config->GetInt(bmdDeckLinkConfigPlaybackGroup, &s->previousGroup)) ||
                 FAILED(config->SetInt(bmdDeckLinkConfigPlaybackGroup, groupId))) return VtrPonDeckLinkBackendError;
-            s->groupConfig = config; s->groupId = groupId;
+            s->groupId = groupId;
         }
         if (s->width <= 0 || s->width > 4096 || s->height <= 0 || s->height > 2160 || FAILED(mode->GetFrameRate(&s->duration, &s->scale)) || s->duration <= 0 || s->scale <= 0) return VtrPonDeckLinkInvalidArgument;
         if (s->duration > 1000000000 || s->scale > 1000000000 || s->scale < s->duration * 10 || s->scale > s->duration * 240) return VtrPonDeckLinkInvalidArgument;
@@ -319,21 +342,29 @@ int32_t openOutputImpl(void *handle, const VtrPonDeckLinkStreamOptions *options,
                 message(error, cap, "Selected output mode or pixel format is unsupported."); return VtrPonDeckLinkBackendError;
             }
         }
-        if (FAILED(s->output->RowBytesForPixelFormat(s->pixel, s->width, &s->rowBytes)) ||
-            FAILED(s->output->EnableVideoOutput(mode->GetDisplayMode(), groupId ? bmdVideoOutputSynchronizeToPlaybackGroup : bmdVideoOutputFlagDefault))) return VtrPonDeckLinkBackendError;
+        // A previous application may have left SDI in RGB 4:4:4 mode. Keep the
+        // hardware setting aligned with the actual scheduled frame format.
+        const auto colorResult = config->SetFlag(bmdDeckLinkConfig444SDIVideoOutput, s->pixel == bmdFormat8BitBGRA);
+        if (FAILED(colorResult) && colorResult != E_NOTIMPL) {
+            message(error, cap, "Output color format could not be configured."); return VtrPonDeckLinkBackendError;
+        }
+        if (outputFailed(s->output->RowBytesForPixelFormat(s->pixel, s->width, &s->rowBytes), "RowBytesForPixelFormat", error, cap) ||
+            outputFailed(s->output->EnableVideoOutput(mode->GetDisplayMode(), groupId ? bmdVideoOutputSynchronizeToPlaybackGroup : bmdVideoOutputFlagDefault), "EnableVideoOutput", error, cap)) return VtrPonDeckLinkBackendError;
         s->videoEnabled = true;
-        if (FAILED(s->output->EnableAudioOutput(bmdAudioSampleRate48kHz, bmdAudioSampleType32bitInteger, 2, bmdAudioOutputStreamTimestamped))) return VtrPonDeckLinkBackendError;
+        if (outputFailed(s->output->EnableAudioOutput(bmdAudioSampleRate48kHz, bmdAudioSampleType32bitInteger, 2, bmdAudioOutputStreamTimestamped), "EnableAudioOutput", error, cap)) return VtrPonDeckLinkBackendError;
         s->audioEnabled = true;
         s->epoch = options->outputStartTime100ns;
         s->latency100ns = *vtrpon::decklink::frameTime100ns(3, s->duration, s->scale);
         s->latencySamples = (s->duration * 3 * 48000 + s->scale - 1) / s->scale;
         s->latest.resize(size_t(s->width) * s->height * 4, 0);
         for (size_t i = 3; i < s->latest.size(); i += 4) s->latest[i] = 255;
-        // Audio is scheduled explicitly on this owner worker. BeginAudioPreroll
-        // polls an audio callback, which this implementation does not register.
-        if (pump(*s) != VtrPonDeckLinkOk) return VtrPonDeckLinkBackendError;
+        // Enter the driver's preroll state before querying/scheduling audio.
+        // Audio samples are supplied explicitly by this owner worker.
+        if (outputFailed(s->output->BeginAudioPreroll(), "BeginAudioPreroll", error, cap)) return VtrPonDeckLinkBackendError;
+        if (pump(*s, error, cap) != VtrPonDeckLinkOk) return VtrPonDeckLinkBackendError;
+        if (outputFailed(s->output->EndAudioPreroll(), "EndAudioPreroll", error, cap)) return VtrPonDeckLinkBackendError;
         if (!groupId) {
-            if (FAILED(s->output->StartScheduledPlayback(0, s->scale, 1.0))) return VtrPonDeckLinkBackendError;
+            if (outputFailed(s->output->StartScheduledPlayback(0, s->scale, 1.0), "StartScheduledPlayback", error, cap)) return VtrPonDeckLinkBackendError;
             s->running = true;
         }
         c.outputState = s; return VtrPonDeckLinkOk;
@@ -403,8 +434,8 @@ int32_t VTRPON_DECKLINK_CALL sendAudio(void *handle, const float *samples, uint3
 int32_t VTRPON_DECKLINK_CALL pumpOutput(void *handle, char *error, uint32_t cap) noexcept {
     return mediaCall(handle, error, cap, [&](Context &c) -> int32_t {
         if (!c.outputState) return VtrPonDeckLinkInvalidArgument;
-        const auto status = pump(*std::static_pointer_cast<OutputState>(c.outputState));
-        if (status) message(error, cap, "DeckLink scheduled output failed; the device may have disconnected."); return status;
+        const auto status = pump(*std::static_pointer_cast<OutputState>(c.outputState), error, cap);
+        if (status && (!error || !cap || !*error)) message(error, cap, "DeckLink scheduled output failed; the device may have disconnected."); return status;
     });
 }
 int32_t VTRPON_DECKLINK_CALL closeOutput(void *handle, char *error, uint32_t cap) noexcept {

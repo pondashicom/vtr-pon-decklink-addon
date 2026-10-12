@@ -12,6 +12,7 @@
 #include <wrl/client.h>
 #include <algorithm>
 #include <cstring>
+#include <cstdio>
 #include <memory>
 #include <thread>
 #include <vector>
