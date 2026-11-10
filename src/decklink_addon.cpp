@@ -9,6 +9,7 @@
 #include <oleauto.h>
 #include "DeckLinkAPI.h"
 #include "DeckLinkAPIVersion.h"
+#include "output_color.h"
 #include <wrl/client.h>
 #include <algorithm>
 #include <cstring>

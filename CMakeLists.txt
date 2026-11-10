@@ -97,6 +97,12 @@ if(VTRPON_DECKLINK_ENABLE_SDK)
         target_include_directories(decklink-sdk-abi-test PRIVATE include)
         add_test(NAME decklink-sdk-abi-contract COMMAND decklink-sdk-abi-test
             "$<TARGET_FILE:vtr-pon-decklink-addon>")
+        add_executable(decklink-output-color-test tests/output_color_test.cpp
+            "${_generated}/DeckLinkAPI_i.c")
+        target_include_directories(decklink-output-color-test PRIVATE src "${_generated}" "${_sdk_include}")
+        target_link_libraries(decklink-output-color-test PRIVATE ole32)
+        add_test(NAME decklink-output-color-no-hardware COMMAND decklink-output-color-test)
+        set_tests_properties(decklink-output-color-no-hardware PROPERTIES SKIP_RETURN_CODE 77)
     endif()
 endif()
 
